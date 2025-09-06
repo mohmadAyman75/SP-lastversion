@@ -1,0 +1,223 @@
+import os
+import re
+import sqlite3
+import time
+import random
+import requests
+from PIL import Image
+from io import BytesIO
+
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.edge.service import Service
+from selenium.webdriver.edge.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from urllib.parse import urljoin
+
+# ---------- الإعدادات ----------
+EMAIL = "mohmadweee75@gmail.com"
+PASSWORD = "01006658620"
+IMG_DIR = r"C:\my\Projectes\Summer Proejct (SP)\Main Fill of SP\static\img"
+BOOK_DIR = r"C:\my\Projectes\Summer Proejct (SP)\Main Fill of SP\static\Books"
+DB_PATH = r"C:\my\Projectes\Summer Proejct (SP)\Main Fill of SP\library_DB.db"
+EDGE_DRIVER_PATH = r"C:\DRIVERS\msedgedriver.exe"
+
+# ---------- تنظيف اسم الملف ----------
+def sanitize_filename(name):
+    return re.sub(r'[\\/*?:"<>|()\']', "_", name).replace(" ", "_")
+
+# ---------- إعداد المتصفح ----------
+options = Options()
+prefs = {
+    "download.default_directory": BOOK_DIR,
+    "download.prompt_for_download": False,
+    "download.directory_upgrade": True
+}
+options.add_experimental_option("prefs", prefs)
+service = Service(executable_path=EDGE_DRIVER_PATH)
+driver = webdriver.Edge(service=service, options=options)
+
+# ---------- تسجيل الدخول ----------
+driver.get("https://en.z-library.sk/")
+time.sleep(3)
+driver.find_element(By.XPATH, "/html/body/div[1]/div/nav/section[2]/a").click()
+time.sleep(2)
+driver.find_element(By.XPATH, '//*[@id="loginForm"]/div[1]/input').send_keys(EMAIL)
+pw_input = driver.find_element(By.XPATH, '//*[@id="loginForm"]/div[2]/input')
+pw_input.send_keys(PASSWORD)
+pw_input.send_keys(Keys.ENTER)
+time.sleep(5)
+
+# ---------- فتح صفحة التوصيات ----------
+driver.get("https://ar.z-library.sk/users/zrecommended#1227113")
+time.sleep(5)
+
+conn = sqlite3.connect(DB_PATH)
+cursor = conn.cursor()
+
+num_books = int(input("\U0001F7E1 كم عدد الكتب التي تريد تحميلها؟ "))
+book_elements = driver.find_elements(By.CSS_SELECTOR, "a.item")
+print(f"\U0001F4DA تم العثور على {len(book_elements)} كتاب في الصفحة.")
+
+downloaded = 0
+book_index = 0
+
+while downloaded < num_books and book_index < len(book_elements):
+    book_link = book_elements[book_index]
+    book_index += 1
+
+    try:
+        z_cover = book_link.find_element(By.TAG_NAME, "z-cover")
+        title = z_cover.get_attribute("title") or "NoTitle"
+        author = z_cover.get_attribute("author") or "NoAuthor"
+        href = book_link.get_attribute("href")
+        book_url = href if href.startswith("http") else "https://en.z-library.sk" + href
+
+        print(f"\n⬇️ جاري معالجة: {title} / {author}")
+        print(f"📎 رابط الكتاب: {book_url}")
+
+        driver.execute_script("window.open(arguments[0]);", book_url)
+        driver.switch_to.window(driver.window_handles[-1])
+        time.sleep(3)
+
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+
+        title_tag = soup.find("h1", class_="book-title")
+        if title_tag:
+            title = title_tag.get_text(strip=True)
+
+        cursor.execute("SELECT 1 FROM Books WHERE name = ?", (title,))
+        if cursor.fetchone():
+            print(f"⏩ تم تخطي الكتاب لأنه محفوظ مسبقًا: {title}")
+            driver.close()
+            driver.switch_to.window(driver.window_handles[0])
+            continue
+
+        safe_title = sanitize_filename(title)
+
+        description_block = soup.find("div", id="bookDescriptionBox")
+        full_info = short_info = "No description available"
+        if description_block:
+            for br in description_block.find_all("br"):
+                br.replace_with("\n")
+            full_info = description_block.get_text(separator='\n', strip=True)
+            sentences = re.split(r'(?<=[.!؟؛])\s+', full_info.strip())
+            short_info = sentences[0] if sentences else full_info[:150]
+
+        genre_block = soup.find("div", class_="bookProperty property__tags")
+        book_type = "General"
+        if genre_block:
+            book_type = genre_block.get_text(strip=True).replace("Tags:", "")
+
+        # -------- صورة الغلاف --------
+        # -------- تحميل صورة الغلاف --------
+        try:
+            z_cover = driver.find_element(By.TAG_NAME, "z-cover")
+            shadow_root = driver.execute_script("return arguments[0].shadowRoot", z_cover)
+            img_element = shadow_root.find_element(By.CSS_SELECTOR, "img.image.cover")
+            image_url = img_element.get_attribute("src")
+            print(f"✅ رابط الصورة: {image_url}")
+
+            response = requests.get(image_url)
+            image = Image.open(BytesIO(response.content))
+            image_filename = f"{safe_title[:120]}_{random.randint(1000,9999)}.jpg"
+            img_path = os.path.join(IMG_DIR, image_filename)
+            image.save(img_path)
+            img_url_db = f"/static/img/{image_filename}"
+
+        except Exception as e:
+            print(f"⚠️ لم يتم تحميل صورة الغلاف: {e}")
+            img_url_db = "default.jpg"
+
+
+
+        # -------- رابط التحميل PDF --------
+        try:
+            dropdown_btn = driver.find_element(By.ID, "btnCheckOtherFormats")
+            dropdown_btn.click()
+            time.sleep(2)
+            pdf_links = driver.find_elements(By.CSS_SELECTOR, "ul.dropdown-menu a")
+
+            pdf_url = None
+            for link in pdf_links:
+                text = link.text.strip().lower()
+                href = link.get_attribute("href")
+                if "pdf" in text and "/dl/" in href:
+                    pdf_url = urljoin("https://en.z-library.sk", href)
+                    break
+
+            if not pdf_url:
+                print(f"⚠️ لا يوجد رابط تحميل PDF داخل القائمة، سيتم تخطي الكتاب.")
+                driver.close()
+                driver.switch_to.window(driver.window_handles[0])
+                continue
+            else:
+                print(f"📥 رابط PDF: {pdf_url}")
+
+        except Exception as e:
+            print(f"⚠️ لم يتم العثور على زر الثلاث نقاط أو روابط PDF: {e}")
+            driver.close()
+            driver.switch_to.window(driver.window_handles[0])
+            continue
+
+        book_filename = f"{safe_title}_{random.randint(1000,9999)}.pdf"[:100]
+        book_path = os.path.join(BOOK_DIR, book_filename)
+
+        try:
+            before_files = set(os.listdir(BOOK_DIR))
+            driver.get(pdf_url)
+            time.sleep(10)
+            after_files = set(os.listdir(BOOK_DIR))
+            new_files = after_files - before_files
+
+            if not new_files:
+                raise Exception("⚠️ لم يتم تحميل أي ملف PDF.")
+
+            new_file = new_files.pop()
+            if not new_file.lower().endswith(".pdf"):
+                raise Exception(f"⚠️ الملف الذي تم تحميله ليس PDF: {new_file}")
+
+            os.rename(os.path.join(BOOK_DIR, new_file), book_path)
+            print(f"✅ تم تحميل الكتاب وإعادة تسميته: {book_filename}")
+
+        except Exception as e:
+            print(f"❌ فشل في تحميل الكتاب: {e}")
+            driver.close()
+            driver.switch_to.window(driver.window_handles[0])
+            continue
+
+        cursor.execute("SELECT MAX(id) FROM Books")
+        max_id = cursor.fetchone()[0]
+        new_id = max_id + 1 if max_id else 1
+
+        cursor.execute("""
+            INSERT INTO Books(id, name, user_id, author, type, price, branch_id, info, photo_url, more_info, book_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (new_id, title, None, author, book_type, random.randint(80, 250), 1,
+             short_info, img_url_db, full_info, book_filename))
+        conn.commit()
+        downloaded += 1
+        print(f"💾 تم حفظ الكتاب: {title}")
+
+        driver.close()
+        driver.switch_to.window(driver.window_handles[0])
+
+    except Exception as e:
+        print(f"❌ خطأ غير متوقع: {e}")
+        try:
+            driver.close()
+            driver.switch_to.window(driver.window_handles[0])
+        except:
+            pass
+        continue
+
+# ---------- النهاية ----------
+driver.quit()
+conn.close()
+print(f"\n✅✅ تم الانتهاء من تحميل وحفظ {downloaded} من أصل {num_books} كتب.")
+"""cd "c:\my\Projectes\Summer Proejct (SP)\Main Fill of SP"
+C:\Users\mohma\PycharmProjects\PythonProject4\.venv\Scripts\activate
+python web_scriping.py"""

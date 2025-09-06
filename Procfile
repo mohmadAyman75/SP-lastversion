@@ -1,0 +1,1 @@
+web : vendor/bin/python/heroku-python-apache2 Fast_API/
